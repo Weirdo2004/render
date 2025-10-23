@@ -1,21 +1,33 @@
 from flask import Flask, request, jsonify
-import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
 import base64
-import sys # Import sys for flushing output
+import sys
+# Import the TFLite runtime
+import tflite_runtime.interpreter as tflite 
 
 app = Flask(__name__)
 
-# --- Load model ---
+# --- Load TFLite model ---
 try:
-    MODEL_PATH = "model.h5"
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print("Model loaded successfully.", flush=True)
+    # Load the TFLite model and allocate tensors.
+    interpreter = tflite.Interpreter(model_path="model.tflite")
+    interpreter.allocate_tensors()
+
+    # Get input and output tensor details.
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    # Get the required input size from the model
+    # This is safer than hardcoding (224, 224)
+    _, input_height, input_width, _ = input_details[0]['shape']
+    
+    print(f"Model loaded. Input size: ({input_height}, {input_width})", flush=True)
+
 except Exception as e:
     print(f"Error loading model: {e}", flush=True)
-    model = None # Set model to None to handle errors
+    interpreter = None
 
 # --- Load labels ---
 try:
@@ -32,52 +44,55 @@ def home():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    # --- ADDED LOGS ---
     print("\n--- Received prediction request ---", flush=True)
     
-    if model is None or not labels:
+    if interpreter is None or not labels:
         print("Error: Model or labels are not loaded.", flush=True)
         return jsonify({"error": "Server configuration error: Model or labels missing."}), 500
         
     try:
         data = request.get_json(force=True)
-        img_b64 = data["input"][0]  # Expect list with single base64 image
+        img_b64 = data["input"][0]
         img_bytes = base64.b64decode(img_b64)
-        
         print("Image decoded from base64.", flush=True)
 
-        # Open image and preprocess
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         
-        # *** IMPORTANT ***
-        # This size MUST match your model's input. 
-        # (224, 224) is common, but check your model.
-        target_size = (224, 224) 
-        img = img.resize(target_size) 
+        # Resize to the model's required input size
+        img = img.resize((input_width, input_height))
         
+        # Convert to numpy array and normalize
         img_array = np.array(img) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)  # add batch dimension
+        
+        # Add batch dimension and ensure it's float32
+        img_array = np.expand_dims(img_array, axis=0).astype(np.float32)
         
         print(f"Image preprocessed. Array shape: {img_array.shape}", flush=True)
 
-        # Predict
-        prediction = model.predict(img_array)
-        pred_index = np.argmax(prediction, axis=1)[0]
+        # --- TFLite Prediction ---
+        # Set the tensor
+        interpreter.set_tensor(input_details[0]['index'], img_array)
+        
+        # Run inference
+        interpreter.invoke()
+
+        # Get the results
+        prediction = interpreter.get_tensor(output_details[0]['index'])[0]
+        # --- End TFLite Prediction ---
+
+        pred_index = np.argmax(prediction)
         pred_label = labels[pred_index]
+        
+        # TFLite outputs probabilities (0-1), not raw logits
         confidence = float(np.max(prediction))
 
         print(f"Prediction: {pred_label}, Confidence: {confidence}", flush=True)
-        # --- END LOGS ---
 
         return jsonify({"prediction": pred_label, "confidence": confidence})
         
     except Exception as e:
-        # --- ADDED LOG ---
         print(f"!!! ERROR processing request: {str(e)}", flush=True)
-        # --- END LOG ---
         return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
-    # This port is specified by Render.
-    port = int(os.environ.get("PORT", 10000)) 
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
